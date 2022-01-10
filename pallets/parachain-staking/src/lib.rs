@@ -2574,26 +2574,113 @@ pub mod pallet {
 		}
 	}
 
-	/// Add reward points to block authors:
-	/// * 20 points to the block producer for producing a block in the chain
-	impl<T: Config> nimbus_primitives::EventHandler<T::AccountId> for Pallet<T> {
+	impl<T: Config> Get<Vec<T::AccountId>> for Pallet<T> {
+		fn get() -> Vec<T::AccountId> {
+			Self::selected_candidates()
+		}
+	}
+
+	impl<T> pallet_authorship::EventHandler<T::AccountId, T::BlockNumber> for Pallet<T>
+	where
+		T: Config + pallet_authorship::Config + pallet_session::Config,
+	{
+		/// Add reward points to block authors:
+		/// * 20 points to the block producer for producing a block in the chain
 		fn note_author(author: T::AccountId) {
 			let now = <Round<T>>::get().current;
 			let score_plus_20 = <AwardedPts<T>>::get(now, &author) + 20;
 			<AwardedPts<T>>::insert(now, author, score_plus_20);
 			<Points<T>>::mutate(now, |x| *x += 20);
+			frame_system::Pallet::<T>::register_extra_weight_unchecked(
+				T::DbWeight::get()
+					.reads_writes(T::DbWeight::get().reads(2), T::DbWeight::get().writes(4)),
+				DispatchClass::Mandatory,
+			);
+		}
+
+		fn note_uncle(_author: T::AccountId, _age: T::BlockNumber) {
+			// we too are not caring.
 		}
 	}
 
-	impl<T: Config> nimbus_primitives::CanAuthor<T::AccountId> for Pallet<T> {
-		fn can_author(account: &T::AccountId, _slot: &u32) -> bool {
-			Self::is_selected_candidate(account)
+	impl<T: Config> pallet_session::SessionManager<T::AccountId> for Pallet<T> {
+		/// 1. A new session starts.
+		/// 2. In hook new_session: Read the current top n candidates from the
+		///    TopCandidates and assign this set to author blocks for the next
+		///    session.
+		/// 3. AuRa queries the authorities from the session pallet for
+		///    this session and picks authors on round-robin-basis from list of
+		///    authorities.
+		fn new_session(new_index: SessionIndex) -> Option<Vec<T::AccountId>> {
+			log::debug!(
+				"assembling new collators for new session {} at #{:?}",
+				new_index,
+				<frame_system::Pallet<T>>::block_number(),
+			);
+
+			frame_system::Pallet::<T>::register_extra_weight_unchecked(
+				T::DbWeight::get().reads(2),
+				DispatchClass::Mandatory,
+			);
+
+			let collators = Pallet::<T>::selected_candidates().to_vec();
+			if collators.is_empty() {
+				// we never want to pass an empty set of collators. This would brick the chain.
+				log::error!("💥 keeping old session because of empty collator set!");
+				None
+			} else {
+				Some(collators)
+			}
+		}
+
+		fn end_session(_end_index: SessionIndex) {
+			// we too are not caring.
+		}
+
+		fn start_session(_start_index: SessionIndex) {
+			// we too are not caring.
 		}
 	}
 
-	impl<T: Config> Get<Vec<T::AccountId>> for Pallet<T> {
-		fn get() -> Vec<T::AccountId> {
-			Self::selected_candidates()
+	impl<T: Config> ShouldEndSession<T::BlockNumber> for Pallet<T> {
+		fn should_end_session(now: T::BlockNumber) -> bool {
+			frame_system::Pallet::<T>::register_extra_weight_unchecked(
+				T::DbWeight::get().reads(2),
+				DispatchClass::Mandatory,
+			);
+
+			let round = <Round<T>>::get();
+			// always update when a new round should start
+			return round.should_update(now);
+		}
+	}
+
+	impl<T: Config> EstimateNextSessionRotation<T::BlockNumber> for Pallet<T> {
+		fn average_session_length() -> T::BlockNumber {
+			T::BlockNumber::from(<Round<T>>::get().length)
+		}
+
+		fn estimate_current_session_progress(now: T::BlockNumber) -> (Option<Permill>, Weight) {
+			let round = <Round<T>>::get();
+			let passed_blocks = now.saturating_sub(round.first);
+
+			(
+				Some(Permill::from_rational(passed_blocks, T::BlockNumber::from(round.length))),
+				// One read for the round info, blocknumber is read free
+				T::DbWeight::get().reads(1),
+			)
+		}
+
+		fn estimate_next_session_rotation(
+			_now: T::BlockNumber,
+		) -> (Option<T::BlockNumber>, Weight) {
+			let round = <Round<T>>::get();
+
+			(
+				Some(round.first + round.length.into()),
+				// One read for the round info, blocknumber is read free
+				T::DbWeight::get().reads(1),
+			)
 		}
 	}
 }
